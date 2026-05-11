@@ -51,6 +51,7 @@ class LiveMonitor:
         output_path: str | Path,
         threshold_multiplier: float = 1.0,
         embed_tokens: Module | None = None,
+        tokenizer: Any = None,
         model_name: str | None = None,
     ):
         """
@@ -73,6 +74,9 @@ class LiveMonitor:
             embed_tokens: Optional embedding module. If provided, the monitor
                 hooks it to capture per-step input token IDs, which are then
                 written to the JSONL records.
+            tokenizer: Optional HF tokenizer. If provided, each record will
+                also include a decoded `token_text` string for the captured
+                token ID.
             model_name: Optional model identifier written into the header
                 record for downstream context.
         """
@@ -90,6 +94,7 @@ class LiveMonitor:
         self.n_layers = len(self.layers)
         self.refusal_directions = refusal_directions.detach().to(torch.float32)
         self.embed_tokens = embed_tokens
+        self.tokenizer = tokenizer
         self.model_name = model_name
         self.threshold_multiplier = float(threshold_multiplier)
 
@@ -118,6 +123,11 @@ class LiveMonitor:
         # embed_tokens hook was not registered or failed to capture.
         self._pending_token_ids: list[int] | None = None
         self._step: int = 0
+        # Turn counter: increments on each new prefill burst (or the first
+        # generate step of a session if the user manages to skip prefill).
+        # Lets the renderer separate distinct chat turns.
+        self._turn: int = 0
+        self._last_stage: str | None = None
 
     def __enter__(self) -> "LiveMonitor":
         self._fh = open(self.output_path, "w", encoding="utf-8")
@@ -153,44 +163,69 @@ class LiveMonitor:
         # n_layers+1 residual snapshots that align with refusal_directions.
         for i, layer in enumerate(self.layers):
             self._handles.append(
-                layer.register_forward_pre_hook(self._make_pre_hook(i))
+                layer.register_forward_pre_hook(
+                    self._make_pre_hook(i), with_kwargs=True
+                )
             )
         self._handles.append(
             self.layers[-1].register_forward_hook(
-                self._make_post_hook(self.n_layers)
+                self._make_post_hook(self.n_layers), with_kwargs=True
             )
         )
 
         if self.embed_tokens is not None:
             self._handles.append(
-                self.embed_tokens.register_forward_pre_hook(self._embed_pre_hook)
+                self.embed_tokens.register_forward_pre_hook(
+                    self._embed_pre_hook, with_kwargs=True
+                )
             )
 
-    def _embed_pre_hook(self, module: Module, args: tuple) -> None:
-        if not args:
+    @staticmethod
+    def _extract_hidden_state(args: tuple, kwargs: dict | None) -> Tensor | None:
+        # Most HF transformer blocks receive the hidden state as the first
+        # positional argument, but some custom models pass it via keyword
+        # ("hidden_states="). Cover both cases.
+        if args:
+            candidate = args[0]
+            if isinstance(candidate, Tensor):
+                return candidate
+        if kwargs:
+            for key in ("hidden_states", "x", "inputs_embeds"):
+                candidate = kwargs.get(key)
+                if isinstance(candidate, Tensor):
+                    return candidate
+        return None
+
+    def _embed_pre_hook(
+        self, module: Module, args: tuple, kwargs: dict
+    ) -> None:
+        input_ids = None
+        if args and isinstance(args[0], Tensor):
+            input_ids = args[0]
+        elif kwargs:
+            for key in ("input", "input_ids"):
+                candidate = kwargs.get(key)
+                if isinstance(candidate, Tensor):
+                    input_ids = candidate
+                    break
+        if input_ids is None or input_ids.dim() < 1:
             return
-        input_ids = args[0]
-        if not isinstance(input_ids, Tensor) or input_ids.dim() < 1:
-            return
-        # Use batch index 0; in interactive chat we always run batch_size=1.
         flat = input_ids.detach()
         if flat.dim() == 2:
             flat = flat[0]
         self._pending_token_ids = [int(x) for x in flat.cpu().tolist()]
 
     def _make_pre_hook(self, layer_idx: int):
-        def hook(module: Module, args: tuple) -> None:
-            if not args:
-                return
-            hidden = args[0]
-            if not isinstance(hidden, Tensor):
+        def hook(module: Module, args: tuple, kwargs: dict) -> None:
+            hidden = self._extract_hidden_state(args, kwargs)
+            if hidden is None:
                 return
             self._captured[layer_idx] = hidden.detach()
 
         return hook
 
     def _make_post_hook(self, layer_idx: int):
-        def hook(module: Module, args: tuple, output: Any) -> None:
+        def hook(module: Module, args: tuple, kwargs: dict, output: Any) -> None:
             hidden = output[0] if isinstance(output, tuple) else output
             if not isinstance(hidden, Tensor):
                 return
@@ -238,6 +273,15 @@ class LiveMonitor:
         # also be reported as "prefill" because seq_len > 1.
         stage = "prefill" if seq_len > 1 else "generate"
 
+        # A new prefill burst marks a new chat turn. Generate steps after
+        # the first prefill inherit the current turn counter.
+        if stage == "prefill" and self._last_stage != "prefill":
+            self._turn += 1
+        elif stage == "generate" and self._last_stage is None:
+            # Edge case: somehow we started with generation (no prefill).
+            self._turn += 1
+        self._last_stage = stage
+
         for p in range(seq_len):
             proj_col = [projections_np[l][p] for l in range(self.n_layers + 1)]
             norm_col = [norms_np[l][p] for l in range(self.n_layers + 1)]
@@ -255,6 +299,7 @@ class LiveMonitor:
             record: dict[str, Any] = {
                 "type": "step",
                 "step": self._step,
+                "turn": self._turn,
                 "stage": stage,
                 "projections": [round(x, 4) for x in proj_col],
                 "norms": [round(x, 3) for x in norm_col],
@@ -266,7 +311,15 @@ class LiveMonitor:
                 ),
             }
             if token_ids is not None and p < len(token_ids):
-                record["token_id"] = token_ids[p]
+                token_id = token_ids[p]
+                record["token_id"] = token_id
+                if self.tokenizer is not None:
+                    try:
+                        record["token_text"] = self.tokenizer.decode(
+                            [token_id], skip_special_tokens=False
+                        )
+                    except Exception:
+                        pass
             self._fh.write(json.dumps(record) + "\n")
             self._step += 1
 

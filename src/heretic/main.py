@@ -193,6 +193,7 @@ def run_live_monitor(
         output_path=output_path,
         threshold_multiplier=settings.live_monitor_threshold_multiplier,
         embed_tokens=model.get_embed_tokens(),
+        tokenizer=model.tokenizer,
         model_name=settings.model,
     )
 
@@ -307,7 +308,11 @@ def run():
     except IndexError:
         existing_study = None
 
-    if existing_study is not None and settings.evaluate_model is None:
+    if (
+        existing_study is not None
+        and settings.evaluate_model is None
+        and not settings.live_monitor
+    ):
         choices = []
 
         if existing_study.user_attrs["finished"]:
@@ -431,7 +436,10 @@ def run():
         settings.batch_size = best_batch_size
         print(f"* Chosen batch size: [bold]{settings.batch_size}[/]")
 
-    if settings.response_prefix is None:
+    # Response-prefix detection is only meaningful when evaluating refusal
+    # rates on the abliterated model. In live-monitor mode we just chat with
+    # the un-abliterated model, so skip this expensive step.
+    if settings.response_prefix is None and not settings.live_monitor:
         print()
         print("Checking for common response prefix...")
         prefix_check_prompts = good_prompts[:100] + bad_prompts[:100]
