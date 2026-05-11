@@ -236,6 +236,35 @@ class Settings(BaseSettings):
         exclude=True,
     )
 
+    live_monitor: bool = Field(
+        default=False,
+        description=(
+            "Whether to skip abliteration and instead open an interactive chat with "
+            "the un-abliterated model, streaming per-layer projections of the residual "
+            "stream onto each layer's refusal direction to a JSONL file. Useful for "
+            "interpretability research: a separate renderer can tail the file to "
+            "produce a live 2D (layer x token) heatmap of harmful-activation spikes."
+        ),
+        exclude=True,
+    )
+
+    live_monitor_path: str = Field(
+        default="live_monitor.jsonl",
+        description="Path to the JSONL file that the live monitor streams records to.",
+        exclude=True,
+    )
+
+    live_monitor_threshold_multiplier: float = Field(
+        default=1.0,
+        description=(
+            "Multiplier applied to the default per-layer threshold "
+            "(=projection of the bad-prompt residual mean onto the refusal direction). "
+            "A token is flagged on layer L when its projection exceeds the threshold. "
+            "Lower values flag more tokens; higher values flag only the strongest spikes."
+        ),
+        exclude=True,
+    )
+
     residual_plot_path: str = Field(
         default="plots",
         description="Base path to save plots of residual vectors to.",

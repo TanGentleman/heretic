@@ -349,6 +349,22 @@ class Model:
         # Text-only models.
         return model.model.layers
 
+    def get_embed_tokens(self) -> Module | None:
+        model = self.model
+
+        if isinstance(model, PeftModel):
+            model = model.base_model.model
+
+        # Most multimodal models.
+        with suppress(Exception):
+            return model.model.language_model.embed_tokens
+
+        # Text-only models.
+        with suppress(Exception):
+            return model.model.embed_tokens
+
+        return None
+
     def get_layer_modules(self, layer_index: int) -> dict[str, list[Module]]:
         layer = self.get_layers()[layer_index]
 

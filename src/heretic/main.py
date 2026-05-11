@@ -64,6 +64,7 @@ from rich.traceback import install
 from .analyzer import Analyzer
 from .config import QuantizationMethod
 from .evaluator import Evaluator
+from .live_monitor import LiveMonitor
 from .model import AbliterationParameters, Model, get_model_class
 from .system import empty_cache, get_accelerator_info
 from .utils import (
@@ -156,6 +157,62 @@ def obtain_merge_strategy(settings: Settings, model: Model) -> str | None:
         return strategy
     else:
         return "merge"
+
+
+def run_live_monitor(
+    settings: Settings,
+    model: Model,
+    refusal_directions: torch.Tensor,
+    good_means: torch.Tensor,
+    bad_means: torch.Tensor,
+) -> None:
+    """
+    Interactive chat with the un-abliterated model, streaming per-layer
+    projections of the residual stream onto each layer's refusal direction
+    to a JSONL file. A separate renderer can tail that file to produce a
+    live 2D (layer x token) heatmap of harmful-activation spikes.
+    """
+    output_path = Path(settings.live_monitor_path)
+
+    print()
+    print("[bold]Live monitor mode[/]")
+    print(
+        f"* Streaming per-layer refusal-direction projections to [bold]{output_path.resolve()}[/]"
+    )
+    print(
+        f"* Threshold multiplier: [bold]{settings.live_monitor_threshold_multiplier}[/] "
+        "(token flagged on layer L when projection > thresholds[L])"
+    )
+    print("* Press [bold]Ctrl+C[/] or submit an empty message to exit.")
+
+    monitor = LiveMonitor(
+        layers=list(model.get_layers()),
+        refusal_directions=refusal_directions,
+        good_means=good_means,
+        bad_means=bad_means,
+        output_path=output_path,
+        threshold_multiplier=settings.live_monitor_threshold_multiplier,
+        embed_tokens=model.get_embed_tokens(),
+        model_name=settings.model,
+    )
+
+    with monitor:
+        chat = [{"role": "system", "content": settings.system_prompt}]
+        while True:
+            try:
+                message = prompt_text("User:", qmark=">", unsafe=True)
+                if not message:
+                    break
+                chat.append({"role": "user", "content": message})
+
+                print("[bold]Assistant:[/] ", end="")
+                response = model.stream_chat_response(chat)
+                chat.append({"role": "assistant", "content": response})
+            except (KeyboardInterrupt, EOFError):
+                break
+
+    print()
+    print(f"* Live monitor records written to [bold]{output_path.resolve()}[/]")
 
 
 def run():
@@ -467,6 +524,10 @@ def run():
         )
         refusal_directions = F.normalize(refusal_directions, p=2, dim=1)
         del good_directions, projection_vector
+
+    if settings.live_monitor:
+        run_live_monitor(settings, model, refusal_directions, good_means, bad_means)
+        return
 
     del good_means, bad_means
 
