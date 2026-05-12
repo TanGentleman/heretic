@@ -246,25 +246,56 @@ def run_live_monitor(
         on_step=on_step,
     )
 
-    # Pick the K layers whose bad-vs-good projection gap is largest — those
-    # are the layers where the refusal direction discriminates best on the
-    # calibration prompts. Adapts automatically across architectures: on
-    # gemma-3-270m this lands on L13–17 (skipping the noisy post-final L18);
-    # on Qwen3-0.6B it lands on L25–27 (skipping the anomalously small L28).
-    # A fixed "last N" heuristic transfers poorly because the post-final
-    # residual has different geometry across model families.
+    # Layer selection for the per-token meter scalar.
+    #
+    # Default (auto): pick the K layers with the largest |bad_proj - good_proj|
+    # gap from the calibration header. Tuned for gemma-3-270m, where this
+    # lands on L13-17 and tracks refusal cleanly. Transfers poorly to models
+    # like Qwen3-0.6B, whose largest header gaps live in bias-saturated late
+    # layers (L25-27, ~15% separation under real generation) while the
+    # cleanest sign-flip discriminator is L19-21 (~170% separation). For
+    # those models, pass --live-monitor-meter-layers 19,20,21 to override.
     METER_TOP_K = 3
-    layer_gaps = [
-        (L, monitor.bad_proj[L] - monitor.good_proj[L])
-        for L in range(monitor.n_layers + 1)
-    ]
-    meter_layer_indices.extend(
-        sorted(L for L, _ in sorted(layer_gaps, key=lambda x: abs(x[1]), reverse=True)[:METER_TOP_K])
-    )
-    print(
-        f"* Refusal meter: averaging layers {meter_layer_indices} "
-        f"(largest bad-vs-good projection gaps)"
-    )
+    explicit_layers = settings.live_monitor_meter_layers
+    if explicit_layers:
+        try:
+            parsed = [int(x.strip()) for x in explicit_layers.split(",") if x.strip()]
+        except ValueError:
+            raise ValueError(
+                f"Could not parse --live-monitor-meter-layers={explicit_layers!r}; "
+                "expected a comma-separated list of integers like '19,20,21'."
+            )
+        if not parsed:
+            raise ValueError("--live-monitor-meter-layers cannot be empty.")
+        out_of_range = [L for L in parsed if not 0 <= L <= monitor.n_layers]
+        if out_of_range:
+            raise ValueError(
+                f"Layer indices {out_of_range} from --live-monitor-meter-layers "
+                f"are out of range [0, {monitor.n_layers}] for this model."
+            )
+        meter_layer_indices.extend(sorted(set(parsed)))
+        print(
+            f"* Refusal meter: averaging explicit layers {meter_layer_indices} "
+            f"(from --live-monitor-meter-layers)"
+        )
+    else:
+        layer_gaps = [
+            (L, monitor.bad_proj[L] - monitor.good_proj[L])
+            for L in range(monitor.n_layers + 1)
+        ]
+        meter_layer_indices.extend(
+            sorted(
+                L
+                for L, _ in sorted(layer_gaps, key=lambda x: abs(x[1]), reverse=True)[
+                    :METER_TOP_K
+                ]
+            )
+        )
+        print(
+            f"* Refusal meter: averaging layers {meter_layer_indices} "
+            f"(auto-selected by largest bad-vs-good projection gap; "
+            f"pass --live-monitor-meter-layers to override)"
+        )
 
     # Sparkline scale: 95th percentile of |last-layer projection| across the
     # whole session. Percentile rather than max so a single structural token
