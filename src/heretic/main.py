@@ -247,6 +247,10 @@ def run_live_monitor(
     # like good/bad mean don't work — they're ~10x smaller than typical
     # per-token projections seen during generation.
     session_projs: list[float] = []
+    # Per-turn mean projections, used to calibrate the verdict thresholds
+    # adaptively. A turn is classified relative to the session's own range
+    # rather than against absolute numbers, which vary wildly across models.
+    session_turn_means: list[float] = []
 
     def current_scale() -> float:
         if not session_projs:
@@ -254,6 +258,33 @@ def run_live_monitor(
         sorted_abs = sorted(abs(p) for p in session_projs)
         idx = max(0, int(0.95 * (len(sorted_abs) - 1)))
         return sorted_abs[idx] or 1.0
+
+    def classify_verdict(turn_mean: float) -> tuple[str, str]:
+        # Returns (label, color). Empirically, refusal turns show uniformly
+        # high projection (mean ~= peak/2) while compliant turns show mean
+        # near the baseline noise level. We split the session's observed
+        # turn-means into thirds: bottom = complied, middle = partial, top
+        # = refused. Need at least 2 prior turns for a meaningful comparison;
+        # otherwise we fall back to a coarse static rule.
+        if len(session_turn_means) < 2:
+            # Bootstrap: use the absolute size of the mean projection.
+            # Calibrated against gemma-3-270m where refusal-turn means are
+            # ~1500+ and compliant turns are a few hundred. Scaled by
+            # current_scale() so this generalizes to other models.
+            ratio = turn_mean / current_scale()
+            if ratio >= 0.4:
+                return ("refused", "red")
+            if ratio >= 0.15:
+                return ("partial", "yellow")
+            return ("complied", "green")
+        prior = sorted(session_turn_means)
+        lo = prior[len(prior) // 3]
+        hi = prior[(2 * len(prior)) // 3]
+        if turn_mean >= hi:
+            return ("refused", "red")
+        if turn_mean <= lo:
+            return ("complied", "green")
+        return ("partial", "yellow")
 
     with monitor:
         chat = [{"role": "system", "content": settings.system_prompt}]
@@ -271,16 +302,15 @@ def run_live_monitor(
 
                 if turn_buffer:
                     projs = [t["proj"] for t in turn_buffer]
-                    peak_idx = max(range(len(projs)), key=lambda i: abs(projs[i]))
-                    peak = projs[peak_idx]
-                    peak_token = turn_buffer[peak_idx]["token_text"].strip() or "?"
+                    turn_mean = sum(projs) / len(projs)
                     session_projs.extend(projs)
                     bar = _sparkline(projs, current_scale())
-                    color = "red" if peak > 0 else "blue"
+                    label, color = classify_verdict(turn_mean)
+                    session_turn_means.append(turn_mean)
                     print(
                         f"  [dim]refusal:[/] {bar}  "
-                        f"peak [{color}]{peak:+.0f}[/{color}] "
-                        f"on token [{color}]{peak_token!r}[/{color}]"
+                        f"mean [{color}]{turn_mean:+.0f}[/{color}]  "
+                        f"[bold {color}]\\[{label}][/]"
                     )
             except (KeyboardInterrupt, EOFError):
                 break
