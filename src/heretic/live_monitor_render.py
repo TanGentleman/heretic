@@ -152,7 +152,15 @@ def _build_figure(state: MonitorState, window: int, title: str):
     return fig, ax, im, cbar, spike_scatter
 
 
-def _refresh(state: MonitorState, window: int, fig, ax, im, spike_scatter):
+def _refresh(
+    state: MonitorState,
+    window: int,
+    fig,
+    ax,
+    im,
+    spike_scatter,
+    clip_percentile: float = 99.0,
+):
     _, np = _import_matplotlib()
     if not state.projections:
         return
@@ -166,8 +174,14 @@ def _refresh(state: MonitorState, window: int, fig, ax, im, spike_scatter):
     # data shape: (n_layers+1, n_cols)
     data = np.asarray(cols, dtype=float).T
 
-    # Symmetric color limits so 0 stays at the colormap midpoint.
-    max_abs = float(np.nanmax(np.abs(data))) if data.size else 1.0
+    # Symmetric color limits so 0 stays at the colormap midpoint. Use a
+    # percentile rather than the absolute max so a handful of outlier columns
+    # (chat-template/BOS tokens project huge) don't crush the dynamic range
+    # of the rest of the heatmap.
+    if data.size:
+        max_abs = float(np.nanpercentile(np.abs(data), clip_percentile))
+    else:
+        max_abs = 1.0
     if max_abs <= 0:
         max_abs = 1.0
     im.set_data(data)
@@ -198,6 +212,7 @@ def render_live(
     window: int = 200,
     poll_interval: float = 0.1,
     update_interval_ms: int = 200,
+    clip_percentile: float = 99.0,
 ):
     """Tail the JSONL and animate a live heatmap."""
     plt, _ = _import_matplotlib()
@@ -264,11 +279,11 @@ def render_live(
 
     def update(_frame):
         if pump():
-            _refresh(state, window, fig, ax, im, spike_scatter)
+            _refresh(state, window, fig, ax, im, spike_scatter, clip_percentile)
         return (im, spike_scatter)
 
     # Render the initial state immediately.
-    _refresh(state, window, fig, ax, im, spike_scatter)
+    _refresh(state, window, fig, ax, im, spike_scatter, clip_percentile)
 
     anim = FuncAnimation(
         fig,
@@ -285,7 +300,12 @@ def render_live(
     fh.close()
 
 
-def render_still(path: Path, output: Path | None, window: int | None = None):
+def render_still(
+    path: Path,
+    output: Path | None,
+    window: int | None = None,
+    clip_percentile: float = 99.0,
+):
     """Read the whole JSONL and produce a single PNG of the heatmap."""
     plt, _ = _import_matplotlib()
 
@@ -303,7 +323,7 @@ def render_still(path: Path, output: Path | None, window: int | None = None):
     effective_window = window if window is not None else len(state.projections)
     title = f"Refusal-direction projections — {state.header.get('model', path.name)}"
     fig, ax, im, cbar, spike_scatter = _build_figure(state, effective_window, title)
-    _refresh(state, effective_window, fig, ax, im, spike_scatter)
+    _refresh(state, effective_window, fig, ax, im, spike_scatter, clip_percentile)
 
     if output is None:
         output = path.with_suffix(".png")
@@ -346,6 +366,17 @@ def main(argv: list[str] | None = None) -> int:
         default=200,
         help="Matplotlib repaint interval in milliseconds.",
     )
+    p_live.add_argument(
+        "--clip-percentile",
+        type=float,
+        default=99.0,
+        help=(
+            "Percentile of |projection| used as the symmetric color limit. "
+            "Lower values make mid-range signal more visible at the cost of "
+            "saturating outlier columns (e.g. chat-template tokens). "
+            "Use 100 to recover the old absolute-max behavior."
+        ),
+    )
 
     p_still = sub.add_parser(
         "still",
@@ -364,6 +395,17 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="If set, only render the last N steps.",
     )
+    p_still.add_argument(
+        "--clip-percentile",
+        type=float,
+        default=99.0,
+        help=(
+            "Percentile of |projection| used as the symmetric color limit. "
+            "Lower values make mid-range signal more visible at the cost of "
+            "saturating outlier columns (e.g. chat-template tokens). "
+            "Use 100 to recover the old absolute-max behavior."
+        ),
+    )
 
     args = parser.parse_args(argv)
 
@@ -373,9 +415,15 @@ def main(argv: list[str] | None = None) -> int:
             window=args.window,
             poll_interval=args.poll_interval,
             update_interval_ms=args.update_interval_ms,
+            clip_percentile=args.clip_percentile,
         )
     elif args.cmd == "still":
-        render_still(args.path, output=args.output, window=args.window)
+        render_still(
+            args.path,
+            output=args.output,
+            window=args.window,
+            clip_percentile=args.clip_percentile,
+        )
     return 0
 
 
