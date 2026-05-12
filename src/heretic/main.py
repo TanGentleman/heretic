@@ -159,6 +159,31 @@ def obtain_merge_strategy(settings: Settings, model: Model) -> str | None:
         return "merge"
 
 
+_SPARKLINE_CHARS = " ▁▂▃▄▅▆▇█"
+
+
+def _sparkline(values: list[float], scale: float) -> str:
+    """Render values as a unicode sparkline scaled by `scale`.
+
+    Values are clipped to [-scale, +scale]; magnitude determines bar height,
+    positive cells are colored red (engaging refusal direction), negative
+    blue (compliant direction). Uses rich markup.
+    """
+    if scale <= 0:
+        scale = 1.0
+    n_levels = len(_SPARKLINE_CHARS) - 1
+    out = []
+    for v in values:
+        magnitude = min(abs(v) / scale, 1.0)
+        idx = round(magnitude * n_levels)
+        ch = _SPARKLINE_CHARS[idx]
+        if v > 0:
+            out.append(f"[red]{ch}[/red]")
+        else:
+            out.append(f"[blue]{ch}[/blue]")
+    return "".join(out)
+
+
 def run_live_monitor(
     settings: Settings,
     model: Model,
@@ -185,6 +210,24 @@ def run_live_monitor(
     )
     print("* Press [bold]Ctrl+C[/] or submit an empty message to exit.")
 
+    # Buffer of last-layer projections for the current assistant turn. The
+    # on_step callback appends to this; the chat loop drains it after each
+    # response to render a sparkline summary.
+    turn_buffer: list[dict] = []
+
+    def on_step(record: dict) -> None:
+        if record.get("stage") != "generate":
+            return
+        projections = record.get("projections") or []
+        if not projections:
+            return
+        turn_buffer.append(
+            {
+                "proj": float(projections[-1]),
+                "token_text": record.get("token_text", ""),
+            }
+        )
+
     monitor = LiveMonitor(
         layers=list(model.get_layers()),
         refusal_directions=refusal_directions,
@@ -195,7 +238,22 @@ def run_live_monitor(
         embed_tokens=model.get_embed_tokens(),
         tokenizer=model.tokenizer,
         model_name=settings.model,
+        on_step=on_step,
     )
+
+    # Sparkline scale: 95th percentile of |last-layer projection| across the
+    # whole session. Percentile rather than max so a single structural token
+    # (EOS, chat-template) doesn't crush the dynamic range. Static references
+    # like good/bad mean don't work — they're ~10x smaller than typical
+    # per-token projections seen during generation.
+    session_projs: list[float] = []
+
+    def current_scale() -> float:
+        if not session_projs:
+            return 1.0
+        sorted_abs = sorted(abs(p) for p in session_projs)
+        idx = max(0, int(0.95 * (len(sorted_abs) - 1)))
+        return sorted_abs[idx] or 1.0
 
     with monitor:
         chat = [{"role": "system", "content": settings.system_prompt}]
@@ -206,9 +264,24 @@ def run_live_monitor(
                     break
                 chat.append({"role": "user", "content": message})
 
+                turn_buffer.clear()
                 print("[bold]Assistant:[/] ", end="")
                 response = model.stream_chat_response(chat)
                 chat.append({"role": "assistant", "content": response})
+
+                if turn_buffer:
+                    projs = [t["proj"] for t in turn_buffer]
+                    peak_idx = max(range(len(projs)), key=lambda i: abs(projs[i]))
+                    peak = projs[peak_idx]
+                    peak_token = turn_buffer[peak_idx]["token_text"].strip() or "?"
+                    session_projs.extend(projs)
+                    bar = _sparkline(projs, current_scale())
+                    color = "red" if peak > 0 else "blue"
+                    print(
+                        f"  [dim]refusal:[/] {bar}  "
+                        f"peak [{color}]{peak:+.0f}[/{color}] "
+                        f"on token [{color}]{peak_token!r}[/{color}]"
+                    )
             except (KeyboardInterrupt, EOFError):
                 break
 
