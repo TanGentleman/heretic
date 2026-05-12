@@ -265,6 +265,22 @@ class Settings(BaseSettings):
         exclude=True,
     )
 
+    live_monitor_meter_layers: str | None = Field(
+        default=None,
+        description=(
+            "Comma-separated list of layer indices (e.g. '19,20,21') to use for the "
+            "per-token refusal-meter scalar, overriding the automatic selection that "
+            "picks the K layers with the largest |bad_proj - good_proj| gap. "
+            "The auto-selector is tuned for gemma-3-270m (lands on L13-17) but "
+            "transfers poorly to models where the largest header gap lives in "
+            "bias-saturated late layers (e.g. Qwen3-0.6B, where the cleanest "
+            "sign-flip separation under real generation lives at L19-21 even though "
+            "L25-27 has a larger header gap). Use --print-residual-geometry to "
+            "inspect candidate layers."
+        ),
+        exclude=True,
+    )
+
     residual_plot_path: str = Field(
         default="plots",
         description="Base path to save plots of residual vectors to.",

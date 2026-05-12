@@ -159,6 +159,31 @@ def obtain_merge_strategy(settings: Settings, model: Model) -> str | None:
         return "merge"
 
 
+_SPARKLINE_CHARS = " ▁▂▃▄▅▆▇█"
+
+
+def _sparkline(values: list[float], scale: float) -> str:
+    """Render values as a unicode sparkline scaled by `scale`.
+
+    Values are clipped to [-scale, +scale]; magnitude determines bar height,
+    positive cells are colored red (engaging refusal direction), negative
+    blue (compliant direction). Uses rich markup.
+    """
+    if scale <= 0:
+        scale = 1.0
+    n_levels = len(_SPARKLINE_CHARS) - 1
+    out = []
+    for v in values:
+        magnitude = min(abs(v) / scale, 1.0)
+        idx = round(magnitude * n_levels)
+        ch = _SPARKLINE_CHARS[idx]
+        if v > 0:
+            out.append(f"[red]{ch}[/red]")
+        else:
+            out.append(f"[blue]{ch}[/blue]")
+    return "".join(out)
+
+
 def run_live_monitor(
     settings: Settings,
     model: Model,
@@ -185,6 +210,29 @@ def run_live_monitor(
     )
     print("* Press [bold]Ctrl+C[/] or submit an empty message to exit.")
 
+    # Buffer of per-token meter projections for the current assistant turn.
+    # The on_step callback appends to this; the chat loop drains it after
+    # each response to render a sparkline summary.
+    turn_buffer: list[dict] = []
+    # Selected layer indices used to compute the per-token meter scalar.
+    # Set once after `monitor` is built (we need its good/bad projection
+    # tables to pick layers); read on every on_step invocation.
+    meter_layer_indices: list[int] = []
+
+    def on_step(record: dict) -> None:
+        if record.get("stage") != "generate":
+            return
+        projections = record.get("projections") or []
+        if not projections or not meter_layer_indices:
+            return
+        selected = [projections[L] for L in meter_layer_indices]
+        turn_buffer.append(
+            {
+                "proj": sum(selected) / len(selected),
+                "token_text": record.get("token_text", ""),
+            }
+        )
+
     monitor = LiveMonitor(
         layers=list(model.get_layers()),
         refusal_directions=refusal_directions,
@@ -195,7 +243,104 @@ def run_live_monitor(
         embed_tokens=model.get_embed_tokens(),
         tokenizer=model.tokenizer,
         model_name=settings.model,
+        on_step=on_step,
     )
+
+    # Layer selection for the per-token meter scalar.
+    #
+    # Default (auto): pick the K layers with the largest |bad_proj - good_proj|
+    # gap from the calibration header. Tuned for gemma-3-270m, where this
+    # lands on L13-17 and tracks refusal cleanly. Transfers poorly to models
+    # like Qwen3-0.6B, whose largest header gaps live in bias-saturated late
+    # layers (L25-27, ~15% separation under real generation) while the
+    # cleanest sign-flip discriminator is L19-21 (~170% separation). For
+    # those models, pass --live-monitor-meter-layers 19,20,21 to override.
+    METER_TOP_K = 3
+    explicit_layers = settings.live_monitor_meter_layers
+    if explicit_layers:
+        try:
+            parsed = [int(x.strip()) for x in explicit_layers.split(",") if x.strip()]
+        except ValueError:
+            raise ValueError(
+                f"Could not parse --live-monitor-meter-layers={explicit_layers!r}; "
+                "expected a comma-separated list of integers like '19,20,21'."
+            )
+        if not parsed:
+            raise ValueError("--live-monitor-meter-layers cannot be empty.")
+        out_of_range = [L for L in parsed if not 0 <= L <= monitor.n_layers]
+        if out_of_range:
+            raise ValueError(
+                f"Layer indices {out_of_range} from --live-monitor-meter-layers "
+                f"are out of range [0, {monitor.n_layers}] for this model."
+            )
+        meter_layer_indices.extend(sorted(set(parsed)))
+        print(
+            f"* Refusal meter: averaging explicit layers {meter_layer_indices} "
+            f"(from --live-monitor-meter-layers)"
+        )
+    else:
+        layer_gaps = [
+            (L, monitor.bad_proj[L] - monitor.good_proj[L])
+            for L in range(monitor.n_layers + 1)
+        ]
+        meter_layer_indices.extend(
+            sorted(
+                L
+                for L, _ in sorted(layer_gaps, key=lambda x: abs(x[1]), reverse=True)[
+                    :METER_TOP_K
+                ]
+            )
+        )
+        print(
+            f"* Refusal meter: averaging layers {meter_layer_indices} "
+            f"(auto-selected by largest bad-vs-good projection gap; "
+            f"pass --live-monitor-meter-layers to override)"
+        )
+
+    # Sparkline scale: 95th percentile of |last-layer projection| across the
+    # whole session. Percentile rather than max so a single structural token
+    # (EOS, chat-template) doesn't crush the dynamic range. Static references
+    # like good/bad mean don't work — they're ~10x smaller than typical
+    # per-token projections seen during generation.
+    session_projs: list[float] = []
+    # Per-turn mean projections, used to calibrate the verdict thresholds
+    # adaptively. A turn is classified relative to the session's own range
+    # rather than against absolute numbers, which vary wildly across models.
+    session_turn_means: list[float] = []
+
+    def current_scale() -> float:
+        if not session_projs:
+            return 1.0
+        sorted_abs = sorted(abs(p) for p in session_projs)
+        idx = max(0, int(0.95 * (len(sorted_abs) - 1)))
+        return sorted_abs[idx] or 1.0
+
+    def classify_verdict(turn_mean: float) -> tuple[str, str]:
+        # Returns (label, color). Empirically, refusal turns show uniformly
+        # high projection (mean ~= peak/2) while compliant turns show mean
+        # near the baseline noise level. We split the session's observed
+        # turn-means into thirds: bottom = complied, middle = partial, top
+        # = refused. Need at least 2 prior turns for a meaningful comparison;
+        # otherwise we fall back to a coarse static rule.
+        if len(session_turn_means) < 2:
+            # Bootstrap: use the absolute size of the mean projection.
+            # Calibrated against gemma-3-270m where refusal-turn means are
+            # ~1500+ and compliant turns are a few hundred. Scaled by
+            # current_scale() so this generalizes to other models.
+            ratio = turn_mean / current_scale()
+            if ratio >= 0.4:
+                return ("refused", "red")
+            if ratio >= 0.15:
+                return ("partial", "yellow")
+            return ("complied", "green")
+        prior = sorted(session_turn_means)
+        lo = prior[len(prior) // 3]
+        hi = prior[(2 * len(prior)) // 3]
+        if turn_mean >= hi:
+            return ("refused", "red")
+        if turn_mean <= lo:
+            return ("complied", "green")
+        return ("partial", "yellow")
 
     with monitor:
         chat = [{"role": "system", "content": settings.system_prompt}]
@@ -206,9 +351,23 @@ def run_live_monitor(
                     break
                 chat.append({"role": "user", "content": message})
 
+                turn_buffer.clear()
                 print("[bold]Assistant:[/] ", end="")
                 response = model.stream_chat_response(chat)
                 chat.append({"role": "assistant", "content": response})
+
+                if turn_buffer:
+                    projs = [t["proj"] for t in turn_buffer]
+                    turn_mean = sum(projs) / len(projs)
+                    session_projs.extend(projs)
+                    bar = _sparkline(projs, current_scale())
+                    label, color = classify_verdict(turn_mean)
+                    session_turn_means.append(turn_mean)
+                    print(
+                        f"  [dim]refusal:[/] {bar}  "
+                        f"mean [{color}]{turn_mean:+.0f}[/{color}]  "
+                        f"[bold {color}]\\[{label}][/]"
+                    )
             except (KeyboardInterrupt, EOFError):
                 break
 

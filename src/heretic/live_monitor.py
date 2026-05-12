@@ -32,8 +32,9 @@ heatmap of `projections`, highlighting cells where `spikes[layer]` is True.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, Callable, TextIO
 
 import torch
 from torch import Tensor
@@ -53,6 +54,7 @@ class LiveMonitor:
         embed_tokens: Module | None = None,
         tokenizer: Any = None,
         model_name: str | None = None,
+        on_step: Callable[[dict], None] | None = None,
     ):
         """
         Args:
@@ -79,6 +81,10 @@ class LiveMonitor:
                 token ID.
             model_name: Optional model identifier written into the header
                 record for downstream context.
+            on_step: Optional callback invoked with each step record after it
+                is written. Lets the caller react to projections in real time
+                (e.g. render a per-token sparkline next to the chat) without
+                re-parsing the JSONL file.
         """
         if refusal_directions.dim() != 2:
             raise ValueError(
@@ -92,6 +98,7 @@ class LiveMonitor:
 
         self.layers = list(layers)
         self.n_layers = len(self.layers)
+        self.on_step = on_step
         self.refusal_directions = refusal_directions.detach().to(torch.float32)
         self.embed_tokens = embed_tokens
         self.tokenizer = tokenizer
@@ -130,6 +137,15 @@ class LiveMonitor:
         self._last_stage: str | None = None
 
     def __enter__(self) -> "LiveMonitor":
+        # Preserve any prior run at this path. Each session has different
+        # calibration data (model, thresholds, refusal direction) so appending
+        # would corrupt downstream renderers; rotating instead keeps every run.
+        if self.output_path.exists():
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            backup = self.output_path.with_suffix(
+                self.output_path.suffix + f".{ts}.bak"
+            )
+            self.output_path.rename(backup)
         self._fh = open(self.output_path, "w", encoding="utf-8")
         header = {
             "type": "header",
@@ -322,6 +338,13 @@ class LiveMonitor:
                         pass
             self._fh.write(json.dumps(record) + "\n")
             self._step += 1
+            if self.on_step is not None:
+                try:
+                    self.on_step(record)
+                except Exception:
+                    # A misbehaving callback must not break the inference loop
+                    # or corrupt the JSONL stream.
+                    pass
 
         self._fh.flush()
         self._captured.clear()
