@@ -210,28 +210,25 @@ def run_live_monitor(
     )
     print("* Press [bold]Ctrl+C[/] or submit an empty message to exit.")
 
-    # Buffer of last-layer projections for the current assistant turn. The
-    # on_step callback appends to this; the chat loop drains it after each
-    # response to render a sparkline summary.
+    # Buffer of per-token meter projections for the current assistant turn.
+    # The on_step callback appends to this; the chat loop drains it after
+    # each response to render a sparkline summary.
     turn_buffer: list[dict] = []
-
-    # Empirically across gemma-3-270m runs (haiku, helpful technical, meth
-    # dangers, jailbreak refusal): layers 16–18 give the cleanest separation
-    # between refusal-engaged and compliant turns (~1200pt gap). The final
-    # layer alone is noisier — a long helpful response can drift positive at
-    # L18 while staying clearly negative at L16/L17. Average the last few.
-    METER_TAIL_LAYERS = 3
+    # Selected layer indices used to compute the per-token meter scalar.
+    # Set once after `monitor` is built (we need its good/bad projection
+    # tables to pick layers); read on every on_step invocation.
+    meter_layer_indices: list[int] = []
 
     def on_step(record: dict) -> None:
         if record.get("stage") != "generate":
             return
         projections = record.get("projections") or []
-        if not projections:
+        if not projections or not meter_layer_indices:
             return
-        tail = projections[-METER_TAIL_LAYERS:]
+        selected = [projections[L] for L in meter_layer_indices]
         turn_buffer.append(
             {
-                "proj": sum(tail) / len(tail),
+                "proj": sum(selected) / len(selected),
                 "token_text": record.get("token_text", ""),
             }
         )
@@ -247,6 +244,26 @@ def run_live_monitor(
         tokenizer=model.tokenizer,
         model_name=settings.model,
         on_step=on_step,
+    )
+
+    # Pick the K layers whose bad-vs-good projection gap is largest — those
+    # are the layers where the refusal direction discriminates best on the
+    # calibration prompts. Adapts automatically across architectures: on
+    # gemma-3-270m this lands on L13–17 (skipping the noisy post-final L18);
+    # on Qwen3-0.6B it lands on L25–27 (skipping the anomalously small L28).
+    # A fixed "last N" heuristic transfers poorly because the post-final
+    # residual has different geometry across model families.
+    METER_TOP_K = 3
+    layer_gaps = [
+        (L, monitor.bad_proj[L] - monitor.good_proj[L])
+        for L in range(monitor.n_layers + 1)
+    ]
+    meter_layer_indices.extend(
+        sorted(L for L, _ in sorted(layer_gaps, key=lambda x: abs(x[1]), reverse=True)[:METER_TOP_K])
+    )
+    print(
+        f"* Refusal meter: averaging layers {meter_layer_indices} "
+        f"(largest bad-vs-good projection gaps)"
     )
 
     # Sparkline scale: 95th percentile of |last-layer projection| across the
