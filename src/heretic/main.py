@@ -215,15 +215,23 @@ def run_live_monitor(
     # response to render a sparkline summary.
     turn_buffer: list[dict] = []
 
+    # Empirically across gemma-3-270m runs (haiku, helpful technical, meth
+    # dangers, jailbreak refusal): layers 16–18 give the cleanest separation
+    # between refusal-engaged and compliant turns (~1200pt gap). The final
+    # layer alone is noisier — a long helpful response can drift positive at
+    # L18 while staying clearly negative at L16/L17. Average the last few.
+    METER_TAIL_LAYERS = 3
+
     def on_step(record: dict) -> None:
         if record.get("stage") != "generate":
             return
         projections = record.get("projections") or []
         if not projections:
             return
+        tail = projections[-METER_TAIL_LAYERS:]
         turn_buffer.append(
             {
-                "proj": float(projections[-1]),
+                "proj": sum(tail) / len(tail),
                 "token_text": record.get("token_text", ""),
             }
         )
